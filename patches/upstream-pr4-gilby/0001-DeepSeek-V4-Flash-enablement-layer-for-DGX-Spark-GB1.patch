@@ -1,0 +1,1123 @@
+From b83c65cd1432e435e00987e8e2971ce605bdb2e2 Mon Sep 17 00:00:00 2001
+From: Kevin Gilbertson <880013+gilby@users.noreply.github.com>
+Date: Sat, 4 Jul 2026 23:50:56 +0200
+Subject: [PATCH 1/2] DeepSeek-V4-Flash enablement layer for DGX Spark
+ (GB10/sm_121a), TP2
+
+The 0.24 base ships the native deepseek_v4 package but cannot serve it on
+GB10. This layer fixes the full cascade, validated end-to-end on 2x DGX
+Spark over RoCE (TP2 + expert parallel):
+
+- pin nvidia-cutlass-dsl 4.5.2: 4.6.0 removed cute.core.ThrMma, which the
+  base's own fused_indexer_q_cutedsl.py still uses (breaks any DSv4 load)
+- DeepGEMM nv_dev @ a6b593d (deepseek-ai/DeepGEMM#324): native sm120
+  kernels for fp8_einsum / tf32_hc_prenorm_gemm / paged mqa logits
+- flashinfer 0.6.14: the swa_topk_lens sparse-MLA decode API the base's
+  flashinfer_sparse.py already targets (image shipped 0.6.12)
+- sm12x-gated overlays: o_proj adapter to the nv_dev einsum API (unpacked
+  fp32 scales, 3D weights), persistent_topk instead of cooperative_topk
+  (cluster launch fails on GB10), exact e8m0->fp32 triton scale upcast
+- serve recipe: marlin MoE + triton linear, VLLM_DEEP_GEMM_WARMUP=skip,
+  --enforce-eager --max-num-seqs 2 (batched long-context decode wedges
+  under every cudagraph mode on GB10 -- documented as a known issue)
+
+Validation: full 12-category multi-turn benchmark, 48/48 turns, zero
+engine errors; 17.8 tok/s single-stream, 28.6 tok/s aggregate; output
+quality graded at parity with the independent jasl-fork GB10 build;
+temp-0 probes numerically consistent with that build.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ Dockerfile.deepseek-v4-gb10-layer             |  64 ++
+ README-DEEPSEEK-V4-GB10.md                    |  83 +++
+ .../kernels/linear/scaled_mm/triton.py        | 226 +++++++
+ .../layers/sparse_attn_indexer.py             | 566 ++++++++++++++++++
+ .../models/deepseek_v4/nvidia/ops/o_proj.py   | 109 ++++
+ 5 files changed, 1048 insertions(+)
+ create mode 100644 Dockerfile.deepseek-v4-gb10-layer
+ create mode 100644 README-DEEPSEEK-V4-GB10.md
+ create mode 100644 overlay-deepseek-v4-gb10/vllm/model_executor/kernels/linear/scaled_mm/triton.py
+ create mode 100644 overlay-deepseek-v4-gb10/vllm/model_executor/layers/sparse_attn_indexer.py
+ create mode 100644 overlay-deepseek-v4-gb10/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+
+diff --git a/Dockerfile.deepseek-v4-gb10-layer b/Dockerfile.deepseek-v4-gb10-layer
+new file mode 100644
+index 0000000..b6ede40
+--- /dev/null
++++ b/Dockerfile.deepseek-v4-gb10-layer
+@@ -0,0 +1,64 @@
++# aeon-vllm-ultimate + DeepSeek-V4-Flash enablement for DGX Spark (GB10 / sm_121a).
++#
++# The 0.24 base already ships the native vllm/models/deepseek_v4 package, but on GB10 its
++# fp8 compute path dies on a cascade of gaps (all validated on 2x DGX Spark, TP2 over RoCE):
++#   1. nvidia-cutlass-dsl 4.6.0 removed cute.core.ThrMma, which the base's own
++#      deepseek_v4/nvidia/ops/fused_indexer_q_cutedsl.py still annotates -> AttributeError
++#      on ANY DeepSeek-V4 load (even on datacenter GPUs). Pin 4.5.2.
++#   2. The vendored DeepGEMM has no sm_12x kernels (fp8_einsum / tf32_hc_prenorm_gemm /
++#      paged mqa logits all assert "Unsupported architecture"). Install DeepGEMM nv_dev
++#      (deepseek-ai/DeepGEMM#324: native sm120 CuTeDSL kernels) into site-packages, which
++#      vllm.utils.deep_gemm prefers over the vendored copy.
++#   3. flashinfer 0.6.12 lacks the swa_topk_lens / extra_sparse_* sparse-MLA decode API that
++#      the base's deepseek_v4/nvidia/flashinfer_sparse.py calls. Upgrade to 0.6.14.
++#   4. Three thin .py overlays (see overlay-deepseek-v4-gb10/):
++#      - o_proj.py: nv_dev fp8_einsum expects unpacked fp32 scales + (h,d,r) weights; adapt
++#        the SM100 packed-ue8m0 layout on sm12x.
++#      - sparse_attn_indexer.py: cooperative_topk's cluster launch fails on GB10
++#        ("invalid argument"); gate sm12x to the existing persistent_topk path.
++#      - scaled_mm/triton.py: cast E8M0 scale tensors to fp32 before the triton block-scaled
++#        MM (triton's JIT has no float8_e8m0fnu mapping; the cast is exact).
++#
++# Serve notes (2-node TP2): --moe-backend marlin --linear-backend triton,
++# VLLM_DEEP_GEMM_WARMUP=skip (the linear warmup pass feeds raw e8m0 scales to fp8_gemm_nt),
++# cudagraph_mode PIECEWISE (FULL decode graphs hang on GB10, cf. vllm#40969).
++FROM ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0
++LABEL aeon.layer="deepseek-v4-gb10" \
++      aeon.base="2026-07-01-v0.24.0" \
++      aeon.fixes="cutlass-dsl-4.5.2-thrmma,deepgemm-nv_dev-sm120,flashinfer-0.6.14-sparse-mla,o_proj-sm12x-adapter,persistent-topk-sm12x,triton-e8m0-upcast"
++
++# (1) cutlass-dsl: 4.6.0 dropped cute.core.ThrMma which the base's cutedsl ops use.
++RUN pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 || true
++RUN pip install --no-cache-dir nvidia-cutlass-dsl==4.5.2 && \
++    python3 -c "import cutlass.cute.core as c; assert hasattr(c, 'ThrMma'); print('cutlass-dsl 4.5.2: ThrMma OK')"
++
++# (2) DeepGEMM nv_dev (sm120 kernels; deepseek-ai/DeepGEMM#324). Pinned commit.
++ENV TORCH_CUDA_ARCH_LIST=12.1a
++RUN git clone https://github.com/deepseek-ai/DeepGEMM.git /opt/deepgemm && \
++    cd /opt/deepgemm && git checkout a6b593d && git submodule update --init --recursive && \
++    MAX_JOBS=8 pip install --no-build-isolation --no-deps -v . 2>&1 | tail -4
++# import check in its own RUN: cwd must not be /opt/deepgemm, or python imports the source tree
++# instead of site-packages ("cannot import name '_C' ... circular import").
++RUN cd / && python3 -c "import deep_gemm; syms=[s for s in ('fp8_einsum','tf32_hc_prenorm_gemm','get_paged_mqa_logits_metadata','fp8_paged_mqa_logits') if hasattr(deep_gemm, s)]; assert len(syms) >= 3, syms; print('deep_gemm nv_dev OK:', syms)"
++
++# (3) flashinfer 0.6.14 (swa_topk_lens sparse-MLA API the base's flashinfer_sparse.py targets).
++RUN pip install --no-cache-dir --no-deps \
++      https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_python-0.6.14-py3-none-any.whl \
++      https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_cubin-0.6.14-py3-none-any.whl \
++      https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_jit_cache-0.6.14+cu130-cp39-abi3-manylinux_2_28_aarch64.whl && \
++    python3 -c "import flashinfer, inspect; from flashinfer.mla import _core; assert 'swa_topk_lens' in inspect.signature(_core.trtllm_batch_decode_sparse_mla_dsv4).parameters; print('flashinfer', flashinfer.__version__, 'sparse-MLA API OK')"
++
++# (4) thin .py overlays (sm12x-gated; no behavior change on sm90/sm100).
++COPY overlay-deepseek-v4-gb10/vllm/ /usr/local/lib/python3.12/site-packages/vllm/
++
++# Smoke: the exact import that breaks on the unpatched base.
++RUN python3 -c "\
++import vllm.models.deepseek_v4 as m; \
++import vllm.models.deepseek_v4.nvidia.ops.o_proj as o; \
++import inspect; src = inspect.getsource(o); \
++assert '_sm12x' in src, 'o_proj sm12x adapter missing'; \
++import vllm.model_executor.layers.sparse_attn_indexer as s; \
++ssrc = inspect.getsource(s); \
++assert 'has_device_capability(120)' in ssrc, 'persistent_topk gate missing'; \
++print('deepseek-v4-gb10 overlay smoke: OK')"
++ENTRYPOINT ["/bin/bash"]
+diff --git a/README-DEEPSEEK-V4-GB10.md b/README-DEEPSEEK-V4-GB10.md
+new file mode 100644
+index 0000000..d274dc1
+--- /dev/null
++++ b/README-DEEPSEEK-V4-GB10.md
+@@ -0,0 +1,83 @@
++# DeepSeek-V4-Flash on 2× DGX Spark (GB10 / sm_121a) — TP2 enablement layer
++
++`Dockerfile.deepseek-v4-gb10-layer` makes the stock `aeon-vllm-ultimate:2026-07-01-v0.24.0`
++image serve **DeepSeek-V4-Flash** across two DGX Sparks (TP=2, expert-parallel, RoCE).
++The base already ships the native `vllm/models/deepseek_v4` package; on GB10 it dies on a
++cascade of five gaps, each fixed here (validated end-to-end on 2× DGX Spark):
++
++| # | Symptom on stock 0.24 (GB10) | Root cause | Fix in this layer |
++|---|---|---|---|
++| 1 | `AttributeError: cutlass.cute.core has no attribute 'ThrMma'` on **any** DeepSeek-V4 load | image ships `nvidia-cutlass-dsl 4.6.0`, which removed `ThrMma`; the base's own `deepseek_v4/nvidia/ops/fused_indexer_q_cutedsl.py` still uses it | pin `nvidia-cutlass-dsl==4.5.2` |
++| 2 | DeepGEMM asserts `Unsupported architecture` (`hyperconnection.hpp`, `attention.hpp`, einsum `layout.hpp`) | vendored DeepGEMM has sm90/sm100 kernels only | install DeepGEMM `nv_dev` @ `a6b593d` ([deepseek-ai/DeepGEMM#324](https://github.com/deepseek-ai/DeepGEMM/pull/324): native sm120 kernels); site-packages takes precedence over the vendored copy |
++| 3 | `trtllm_batch_decode_sparse_mla_dsv4() got an unexpected keyword 'swa_topk_lens'` | the base's `flashinfer_sparse.py` targets the 0.6.14 sparse-MLA API; image ships flashinfer 0.6.12 | upgrade flashinfer trio to 0.6.14 (python+cubin+jit-cache cu130/aarch64) |
++| 4 | nv_dev `fp8_einsum` asserts `t.dim() == N`; `cooperative_topk launch failed: invalid argument`; triton `KeyError: 'float8_e8m0fnu'` | o_proj passes SM100 packed-ue8m0 layout; cooperative topk needs cluster launch GB10 lacks; triton JIT has no E8M0 dtype | three thin `.py` overlays, all gated to sm12x (no change on sm90/100): o_proj scale/shape adapter → nv_dev API; route sm12x to the existing `persistent_topk`; exact e8m0→fp32 scale upcast |
++| 5 | `deep_gemm_warmup` asserts `sfb_dtype == kFloat or kInt`; batched long-context decode hangs (`sample_tokens` RPC timeout) under every cudagraph mode | linear warmup feeds raw e8m0 scales to `fp8_gemm_nt`; graph-replay + sparse-MLA decode wedge on GB10 (cf. [vllm#40969](https://github.com/vllm-project/vllm/issues/40969); see Known issue below) | serve flags: `VLLM_DEEP_GEMM_WARMUP=skip`, `--enforce-eager`, `--max-num-seqs 2` |
++
++## Build
++
++```bash
++docker build -t aeon-vllm-ultimate:deepseek-v4-gb10 -f Dockerfile.deepseek-v4-gb10-layer .
++```
++
++## Serve (2 nodes, TP2 + EP over RoCE)
++
++Head (rank 0) — swap in your fabric IPs/ifaces; worker (rank 1) is identical plus `--headless`
++and `--node-rank 1`:
++
++```bash
++docker run -d --name vllm-ds4 --runtime nvidia --gpus all --ipc host --network host \
++  --shm-size 16g --cap-add=SYS_PTRACE --cap-add=IPC_LOCK --ulimit memlock=-1:-1 \
++  --device=/dev/infiniband \
++  -v /path/to/models:/models -v /path/to/flashinfer-cache:/root/.cache/flashinfer \
++  -v /path/to/triton-cache:/root/.triton \
++  -e VLLM_HOST_IP=<this-node-fabric-ip> \
++  -e NCCL_IB_HCA=<roce-hca> -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_DISABLE=0 \
++  -e NCCL_SOCKET_IFNAME=<fabric-if> -e GLOO_SOCKET_IFNAME=<fabric-if> \
++  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e TORCH_CUDA_ARCH_LIST=12.1a \
++  -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
++  -e VLLM_DEEP_GEMM_WARMUP=skip \
++  -e VLLM_RPC_TIMEOUT=3600000 -e TRITON_CACHE_DIR=/root/.triton \
++  -e VLLM_USE_BREAKABLE_CUDAGRAPH=0 -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
++  --entrypoint vllm aeon-vllm-ultimate:deepseek-v4-gb10 \
++  serve /models/deepseek-ai/DeepSeek-V4-Flash \
++  --served-model-name DeepSeek-V4-Flash --trust-remote-code --tokenizer-mode deepseek_v4 \
++  --tensor-parallel-size 2 --enable-expert-parallel \
++  --moe-backend marlin --linear-backend triton \
++  --distributed-executor-backend mp --nnodes 2 --node-rank 0 \
++  --master-addr <head-fabric-ip> --master-port 29519 \
++  --kv-cache-dtype fp8 --block-size 256 --enable-prefix-caching \
++  --max-model-len 65536 --max-num-seqs 2 --max-num-batched-tokens 4096 \
++  --gpu-memory-utilization 0.80 --no-enable-flashinfer-autotune \
++  --enforce-eager \
++  --reasoning-parser deepseek_v4 --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
++  --load-format safetensors --host 0.0.0.0 --port 8000
++```
++
++Notes:
++- **First cold start JIT-compiles flashinfer 0.6.14 kernels (~20 min).** Launch both ranks
++  together only after the cache is warm, or rank 1's Gloo barrier can time out
++  (`Application timeout caused pair closure`). Persist `/root/.cache/flashinfer`.
++- `--moe-backend marlin` covers the MXFP4/fp8 expert checkpoints; `--linear-backend triton`
++  covers the E8M0 fp8 linears (with the overlay upcast).
++- `NCCL 2.28.9` in the base works cross-node over RoCE as-is (no LD_PRELOAD needed).
++- **Known issue — batched long-context decode wedges the engine; run `--enforce-eager`
++  and `--max-num-seqs 2`.** With any cudagraph mode (FULL, PIECEWISE, or the base's
++  auto-enabled breakable-cudagraph) the workers go silent during batched decode once
++  accumulated contexts grow past a few thousand tokens; `sample_tokens` RPC times out and
++  the engine dies. `VLLM_USE_BREAKABLE_CUDAGRAPH=0` extends survival ~6× and eager mode +
++  `max_num_seqs 2` is fully stable (complete 12-category multi-turn benchmark, 48/48 turns,
++  zero engine errors). Suspect: sparse-MLA decode path (nv_dev paged-MQA / persistent_topk /
++  flashinfer trtllm sparse) at batch>2 with long contexts — needs kernel-level investigation.
++  `VLLM_RPC_TIMEOUT=3600000` + `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600` are belt-and-braces
++  for first-contact Triton JIT spikes; persist `/root/.triton` so those compile only once.
++
++## Validation (2× DGX Spark GB10, DeepSeek-V4-Flash-DSpark fp8)
++
++- Engine init 58 s (warm cache); GPU KV cache **782,838 tokens** (gpu_mem_util 0.80).
++- Numerically sane at temp 0 (exact-arithmetic + factual probes match a known-good
++  independent GB10 build within phrasing variance); coherent long-form generation; a full
++  12-category multi-turn benchmark graded at quality parity with that independent build.
++- Final config (eager, max_num_seqs 2): **complete benchmark run with zero engine errors —
++  48/48 turns**, single-stream decode **17.8 tok/s** (TTFT ~2.8 s), **28.6 tok/s aggregate**
++  across 10 concurrent multi-turn categories.
++- 2×10 concurrent 1500-token generations: 20/20 HTTP 200, engine alive.
+diff --git a/overlay-deepseek-v4-gb10/vllm/model_executor/kernels/linear/scaled_mm/triton.py b/overlay-deepseek-v4-gb10/vllm/model_executor/kernels/linear/scaled_mm/triton.py
+new file mode 100644
+index 0000000..4952b0e
+--- /dev/null
++++ b/overlay-deepseek-v4-gb10/vllm/model_executor/kernels/linear/scaled_mm/triton.py
+@@ -0,0 +1,226 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
++    triton_scaled_mm,
++)
++from vllm.model_executor.layers.quantization.utils import replace_parameter
++from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
++    convert_to_channelwise,
++)
++from vllm.platforms import current_platform
++from vllm.utils.torch_utils import direct_register_custom_op
++
++from .BlockScaledMMLinearKernel import (
++    Fp8BlockScaledMMLinearKernel,
++)
++from .cutlass import CutlassInt8ScaledMMLinearKernel
++from .ScaledMMLinearKernel import (
++    Int8ScaledMMLinearLayerConfig,
++)
++
++
++class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
++    @classmethod
++    def is_supported(
++        cls, compute_capability: int | None = None
++    ) -> tuple[bool, str | None]:
++        if current_platform.is_cuda_alike():
++            return True, None
++        return False, "requires ROCm or CUDA."
++
++    @classmethod
++    def can_implement(cls, c: Int8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
++        return True, None
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        w_q, _, i_s, _, _ = self._get_layer_params(layer)
++        w_q_name, w_s_name, i_s_name, i_zp_name, azp_adj_name = self.layer_param_names
++
++        replace_parameter(
++            layer,
++            w_q_name,
++            torch.nn.Parameter(w_q.t().data, requires_grad=False),
++        )
++
++        # WEIGHT SCALE
++        # Triton kernel supports only per-tensor and per-channel.
++        # If we have a fused module (QKV, MLP) with per tensor scales (thus N
++        # scales being passed to the kernel), convert to the per-channel case.
++        is_fused_module = len(layer.logical_widths) > 1
++        weight_scale = getattr(layer, w_s_name)
++        if is_fused_module and not self.config.is_channelwise:
++            weight_scale = convert_to_channelwise(weight_scale, layer.logical_widths)
++        replace_parameter(
++            layer,
++            w_s_name,
++            torch.nn.Parameter(weight_scale.data, requires_grad=False),
++        )
++
++        # INPUT SCALE
++        if self.config.is_static_input_scheme:
++            assert i_s is not None
++
++            if self.config.input_symmetric:
++                replace_parameter(
++                    layer,
++                    i_s_name,
++                    torch.nn.Parameter(i_s.max(), requires_grad=False),
++                )
++                setattr(layer, i_zp_name, None)
++            else:
++                input_zero_point = getattr(layer, i_zp_name)
++
++                # Reconstruct the ranges to find a single scale and azp
++                int8_traits = torch.iinfo(torch.int8)
++                azps = input_zero_point.to(dtype=torch.int32)
++                range_max = (i_s * (int8_traits.max - azps)).max()
++                range_min = (i_s * (int8_traits.min - azps)).min()
++
++                scale = (range_max - range_min) / (int8_traits.max - int8_traits.min)
++                replace_parameter(
++                    layer,
++                    i_s_name,
++                    torch.nn.Parameter(scale, requires_grad=False),
++                )
++
++                # AZP loaded as int8 but used as int32
++                azp = (int8_traits.min - range_min / scale).to(dtype=torch.int32)
++                replace_parameter(
++                    layer,
++                    i_zp_name,
++                    torch.nn.Parameter(azp, requires_grad=False),
++                )
++        else:
++            setattr(layer, i_s_name, None)
++            setattr(layer, i_zp_name, None)
++
++        # azp_adj is the AZP adjustment term, used to account for weights.
++        # It does not depend on scales or azp, so it is the same for
++        # static and dynamic quantization.
++        # See csrc/quantization/w8a8/cutlass/Epilogues.md for the math.
++        if not self.config.input_symmetric:
++            weight = getattr(layer, w_q_name)
++            # weight is already transposed to [K, N], sum over K (dim=0)
++            azp_adj = weight.sum(dim=0, keepdim=True, dtype=torch.int32)
++            if self.config.is_static_input_scheme:
++                # Fold azp into azp_adj for the per-tensor case
++                azp_adj = getattr(layer, i_zp_name) * azp_adj
++            setattr(
++                layer,
++                azp_adj_name,
++                torch.nn.Parameter(azp_adj, requires_grad=False),
++            )
++        else:
++            setattr(layer, azp_adj_name, None)
++
++    def apply_weights(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        w_q, w_s, i_s, i_zp, azp_adj = self._get_layer_params(layer)
++
++        symmetric = azp_adj is None
++        x_q, x_s, x_zp = ops.scaled_int8_quant(
++            x.contiguous(), i_s, i_zp, symmetric=symmetric
++        )
++
++        out = triton_scaled_mm(
++            x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=x.dtype, bias=bias
++        )
++
++        if azp_adj is not None:
++            # Asymmetric quantization: subtract the zero-point correction.
++            # D = scale_a * scale_b * (A_q @ B_q - azp * azp_adj) + bias
++            # triton_scaled_mm already computed scale_a * scale_b * (A_q @ B_q) + bias
++            # so we subtract scale_a * scale_b * azp * azp_adj
++            #
++            # x_s: [M, 1] or scalar, w_s: [N, 1] or scalar, azp_adj: [1, N]
++            # Reshape w_s from [N, 1] to [1, N] for proper broadcasting.
++            w_s_row = w_s.view(1, -1) if w_s.dim() > 0 else w_s
++            static = i_zp is not None
++            if not static and x_zp is not None:
++                # Dynamic per-token: azp is per-token, azp_adj is per-channel
++                # x_zp: [M, 1], azp_adj: [1, N]
++                out -= x_s * w_s_row * (x_zp * azp_adj).to(x.dtype)
++            else:
++                # Static per-tensor: azp already folded into azp_adj
++                out -= (x_s * w_s_row * azp_adj).to(x.dtype)
++
++        return out
++
++
++class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
++    @classmethod
++    def is_supported(cls, compute_capability=None):
++        if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
++            return False, "only CUDA-alike and XPU devices are supported."
++        return True, None
++
++    def apply_block_scaled_mm(
++        self,
++        A: torch.Tensor,
++        B: torch.Tensor,
++        As: torch.Tensor,
++        Bs: torch.Tensor,
++    ) -> torch.Tensor:
++        return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
++            A,
++            B,
++            As,
++            Bs,
++            list(self.weight_group_shape),
++            self.config.out_dtype,
++        )
++
++
++# TODO we should be able to change the type of block_size to GroupShape
++# after we resolve GroupShape compilation issue
++# https://github.com/vllm-project/vllm/issues/25270
++def _w8a8_triton_block_scaled_mm_func(
++    qx: torch.Tensor,
++    weight: torch.Tensor,
++    x_scale: torch.Tensor,
++    weight_scale: torch.Tensor,
++    block_size: list[int],
++    output_dtype: torch.dtype,
++) -> torch.Tensor:
++    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++        w8a8_triton_block_scaled_mm,
++    )
++
++    # PATCH sm12x: triton JIT has no float8_e8m0fnu mapping; E8M0 is a pure power-of-2
++    # exponent so casting to f32 is exact and preserves the scale values.
++    if x_scale.dtype == torch.float8_e8m0fnu:
++        x_scale = x_scale.to(torch.float32)
++    if weight_scale.dtype == torch.float8_e8m0fnu:
++        weight_scale = weight_scale.to(torch.float32)
++    return w8a8_triton_block_scaled_mm(
++        qx, weight, x_scale, weight_scale, block_size, output_dtype
++    )
++
++
++def _w8a8_triton_block_scaled_mm_fake(
++    qx: torch.Tensor,
++    weight: torch.Tensor,
++    x_scale: torch.Tensor,
++    weight_scale: torch.Tensor,
++    block_size: list[int],
++    output_dtype: torch.dtype,
++) -> torch.Tensor:
++    return torch.empty(
++        (qx.size(0), weight.size(0)), dtype=output_dtype, device=qx.device
++    )
++
++
++direct_register_custom_op(
++    "w8a8_triton_block_scaled_mm_func",
++    _w8a8_triton_block_scaled_mm_func,
++    fake_impl=_w8a8_triton_block_scaled_mm_fake,
++)
+diff --git a/overlay-deepseek-v4-gb10/vllm/model_executor/layers/sparse_attn_indexer.py b/overlay-deepseek-v4-gb10/vllm/model_executor/layers/sparse_attn_indexer.py
+new file mode 100644
+index 0000000..3f3b400
+--- /dev/null
++++ b/overlay-deepseek-v4-gb10/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -0,0 +1,566 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Custom Sparse Attention Indexer layers."""
++
++import torch
++
++import vllm.envs as envs
++from vllm import _custom_ops as ops
++from vllm._aiter_ops import rocm_aiter_ops
++from vllm.compilation.breakable_cudagraph import eager_break_during_capture
++from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
++from vllm.model_executor.custom_op import CustomOp
++from vllm.platforms import current_platform
++from vllm.utils.deep_gemm import (
++    fp8_fp4_mqa_logits,
++    fp8_fp4_paged_mqa_logits,
++    has_deep_gemm,
++)
++from vllm.utils.torch_utils import (
++    LayerNameType,
++    _encode_layer_name,
++    _resolve_layer_name,
++    direct_register_custom_op,
++)
++from vllm.v1.attention.backends.mla.indexer import (
++    DeepseekV32IndexerMetadata,
++)
++from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.worker.workspace import current_workspace_manager
++
++logger = init_logger(__name__)
++
++RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
++
++# MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
++MXFP4_BLOCK_SIZE = 32
++
++
++def _gather_workspace_shapes(
++    total_seq_lens: int,
++    head_dim: int,
++    fp8_dtype: torch.dtype,
++    use_fp4_cache: bool,
++) -> tuple[tuple[tuple[int, int], torch.dtype], tuple[tuple[int, int], torch.dtype]]:
++    """Return ((values_shape, values_dtype), (scales_shape, scales_dtype)) for
++    the K-gather workspace. FP8 path: (T, head_dim) fp8 + (T, 4) uint8 fp32
++    scales. MXFP4 path: (T, head_dim // 2) uint8 packed mxfp4 +
++    (T, head_dim // MXFP4_BLOCK_SIZE) uint8 ue8m0 scales."""
++    if use_fp4_cache:
++        return (
++            ((total_seq_lens, head_dim // 2), torch.uint8),
++            ((total_seq_lens, head_dim // MXFP4_BLOCK_SIZE), torch.uint8),
++        )
++    return (
++        ((total_seq_lens, head_dim), fp8_dtype),
++        ((total_seq_lens, 4), torch.uint8),
++    )
++
++
++def kv_cache_as_quant_view(
++    kv_cache: torch.Tensor,
++    head_dim: int,
++    use_fp4_cache: bool,
++) -> torch.Tensor:
++    """4D ``[num_blocks, block_size, 1, head_width]`` view expected by
++    DeepGEMM, from the 3D indexer kv-cache allocation."""
++    if use_fp4_cache:
++        assert kv_cache.ndim == 3 and kv_cache.dtype == torch.uint8
++        num_blocks, block_size, _ = kv_cache.shape
++        page_bytes = int(kv_cache.stride(0))
++        fp4_bytes = head_dim // 2 + head_dim // MXFP4_BLOCK_SIZE
++        return torch.as_strided(
++            kv_cache,
++            size=(num_blocks, block_size, 1, fp4_bytes),
++            stride=(page_bytes, fp4_bytes, fp4_bytes, 1),
++        )
++    return kv_cache.unsqueeze(-2)
++
++
++@eager_break_during_capture
++def sparse_attn_indexer(
++    hidden_states: torch.Tensor,
++    k_cache_prefix: LayerNameType,
++    kv_cache: torch.Tensor,
++    q_quant: torch.Tensor,
++    q_scale: torch.Tensor | None,
++    k: torch.Tensor,
++    weights: torch.Tensor,
++    quant_block_size: int,
++    scale_fmt: str | None,
++    topk_tokens: int,
++    head_dim: int,
++    max_model_len: int,
++    total_seq_lens: int,
++    topk_indices_buffer: torch.Tensor,
++    skip_k_cache_insert: bool,
++    use_fp4_cache: bool = False,
++) -> torch.Tensor:
++    # careful! this will be None in dummy run
++    attn_metadata = get_forward_context().attn_metadata
++    fp8_dtype = current_platform.fp8_dtype()
++    k_cache_prefix = _resolve_layer_name(k_cache_prefix)
++
++    # assert isinstance(attn_metadata, dict)
++    if not isinstance(attn_metadata, dict):
++        # Reserve workspace for indexer during profiling run
++        values_spec, scales_spec = _gather_workspace_shapes(
++            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
++        )
++        current_workspace_manager().get_simultaneous(
++            values_spec,
++            scales_spec,
++            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++        )
++
++        # Dummy allocation to simulate for peak logits tensor memory during inference.
++        # FP8 elements so elements == bytes
++        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++        _ = torch.empty(
++            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
++        )
++
++        return sparse_attn_indexer_fake(
++            hidden_states,
++            k_cache_prefix,
++            kv_cache,
++            q_quant,
++            q_scale,
++            k,
++            weights,
++            quant_block_size,
++            scale_fmt,
++            topk_tokens,
++            head_dim,
++            max_model_len,
++            total_seq_lens,
++            topk_indices_buffer,
++            skip_k_cache_insert,
++            use_fp4_cache,
++        )
++    attn_metadata_narrowed = attn_metadata[k_cache_prefix]
++    assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
++    slot_mapping = attn_metadata_narrowed.slot_mapping
++    has_decode = attn_metadata_narrowed.num_decodes > 0
++    has_prefill = attn_metadata_narrowed.num_prefills > 0
++    num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
++
++    # q_scale is required iff the FP4 cache path is enabled; the FP8 path
++    # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
++    if use_fp4_cache:
++        assert q_scale is not None, "use_fp4_cache=True requires q_scale"
++    else:
++        assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
++
++    # During speculative decoding, k may be padded to the CUDA graph batch
++    # size while slot_mapping only covers actual tokens. Truncate k to avoid
++    # out-of-bounds reads in the kernel.
++    num_tokens = slot_mapping.shape[0]
++    if k is not None:
++        k = k[:num_tokens]
++
++    if not skip_k_cache_insert:
++        # scale_fmt can be None, but the function expects str
++        assert scale_fmt is not None
++        assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
++        ops.indexer_k_quant_and_cache(
++            k,
++            kv_cache,
++            slot_mapping,
++            quant_block_size,
++            scale_fmt,
++        )
++
++    topk_indices_buffer[: hidden_states.shape[0]] = -1
++    if has_prefill:
++        prefill_metadata = attn_metadata_narrowed.prefill
++        assert prefill_metadata is not None
++
++        # Get the full shared workspace buffers once (will allocate on first use).
++        # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
++        # MXFP4 (head_dim/2 bytes packed + head_dim/MXFP4_BLOCK_SIZE ue8m0
++        # scales) based on use_fp4_cache.
++        workspace_manager = current_workspace_manager()
++        values_spec, scales_spec = _gather_workspace_shapes(
++            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
++        )
++        k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
++            values_spec,
++            scales_spec,
++        )
++        for chunk in prefill_metadata.chunks:
++            k_quant = k_quant_full[: chunk.total_seq_lens]
++            k_scale = k_scale_full[: chunk.total_seq_lens]
++
++            if not chunk.skip_kv_gather:
++                ops.cp_gather_indexer_k_quant_cache(
++                    kv_cache,
++                    k_quant,
++                    k_scale,
++                    chunk.block_table,
++                    chunk.cu_seq_lens,
++                )
++
++            q_slice = q_quant[chunk.token_start : chunk.token_end]
++            q_scale_slice = (
++                q_scale[chunk.token_start : chunk.token_end]
++                if q_scale is not None
++                else None
++            )
++            # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8
++            # (kPackedFP4), scales → int32 squeezed to 1-D kv_sf / 2-D q_sf.
++            if use_fp4_cache:
++                q_slice_cast = q_slice.view(torch.int8)
++                k_quant_cast = k_quant.view(torch.int8)
++                k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
++            else:
++                q_slice_cast = q_slice
++                k_quant_cast = k_quant
++                k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
++            if current_platform.is_xpu():
++                if q_scale_slice is not None:
++                    raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
++                logits = torch.ops.vllm.xpu_fp8_mqa_logits(
++                    q_slice_cast,
++                    k_quant_cast,
++                    k_scale_cast,
++                    weights[chunk.token_start : chunk.token_end],
++                    chunk.cu_seqlen_ks,
++                    chunk.cu_seqlen_ke,
++                )
++            else:
++                logits = fp8_fp4_mqa_logits(
++                    (q_slice_cast, q_scale_slice),
++                    (k_quant_cast, k_scale_cast),
++                    weights[chunk.token_start : chunk.token_end],
++                    chunk.cu_seqlen_ks,
++                    chunk.cu_seqlen_ke,
++                    clean_logits=False,
++                )
++            num_rows = logits.shape[0]
++
++            topk_indices = topk_indices_buffer[
++                chunk.token_start : chunk.token_end, :topk_tokens
++            ]
++
++            ops.top_k_per_row_prefill(
++                logits,
++                chunk.cu_seqlen_ks,
++                chunk.cu_seqlen_ke,
++                topk_indices,
++                num_rows,
++                logits.stride(0),
++                logits.stride(1),
++                topk_tokens,
++            )
++
++    if has_decode:
++        decode_metadata = attn_metadata_narrowed.decode
++        assert decode_metadata is not None
++        kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
++        decode_lens = decode_metadata.decode_lens
++        if decode_metadata.requires_padding:
++            # pad in edge case where we have short chunked prefill length <
++            # decode_threshold since we unstrictly split
++            # prefill and decode by decode_threshold
++            # (currently set to 1 + speculative tokens).
++            # FP8 Q is float8_e4m3fn (pack_seq_triton's fp32 pad path is OK —
++            # downstream context_lens masks stale slots). MXFP4 Q is two
++            # uint8 tensors (values + ue8m0 scales) — use the dedicated uint8
++            # packer with pad_byte=0 so padded slots dequantize to 0 and
++            # can't produce NaN/Inf in the logits kernel.
++            if q_scale is not None:
++                padded_q_quant_decode_tokens = pack_seq_triton(
++                    q_quant[:num_decode_tokens], decode_lens, pad_value=0
++                )
++                padded_q_scale = pack_seq_triton(
++                    q_scale[:num_decode_tokens], decode_lens, pad_value=0
++                )
++            else:
++                padded_q_quant_decode_tokens = pack_seq_triton(
++                    q_quant[:num_decode_tokens], decode_lens
++                )
++                padded_q_scale = None
++        else:
++            padded_q_quant_decode_tokens = q_quant[:num_decode_tokens].reshape(
++                decode_lens.shape[0], -1, *q_quant.shape[1:]
++            )
++            if q_scale is not None:
++                padded_q_scale = q_scale[:num_decode_tokens].reshape(
++                    decode_lens.shape[0], -1, *q_scale.shape[1:]
++                )
++            else:
++                padded_q_scale = None
++        # TODO: move and optimize below logic with triton kernels
++        batch_size = padded_q_quant_decode_tokens.shape[0]
++        next_n = padded_q_quant_decode_tokens.shape[1]
++        num_padded_tokens = batch_size * next_n
++        seq_lens = decode_metadata.seq_lens[:batch_size]
++        # seq_lens is always 2D: (B, next_n) for native spec decode, (B, 1)
++        # otherwise. deep_gemm fp8_fp4_paged_mqa_logits requires 2D context_lens;
++        # the downstream topk kernels accept both 1D and 2D.
++        padded_q_quant_cast = (
++            padded_q_quant_decode_tokens.view(torch.int8)
++            if use_fp4_cache
++            else padded_q_quant_decode_tokens
++        )
++        if current_platform.is_xpu():
++            if padded_q_scale is not None:
++                raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
++            seq_lens_xpu = (
++                seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
++            )
++            logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
++                padded_q_quant_cast,
++                kv_cache,
++                weights[:num_padded_tokens],
++                seq_lens_xpu,
++                decode_metadata.block_table,
++                decode_metadata.schedule_metadata,
++                max_model_len,
++            )
++        else:
++            logits = fp8_fp4_paged_mqa_logits(
++                (padded_q_quant_cast, padded_q_scale),
++                kv_cache,
++                weights[:num_padded_tokens],
++                seq_lens,
++                decode_metadata.block_table,
++                decode_metadata.schedule_metadata,
++                max_model_len=max_model_len,
++                clean_logits=False,
++            )
++        num_rows = logits.shape[0]
++        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
++
++        use_cooperative_topk = (
++            current_platform.is_cuda()
++            and topk_tokens in (512, 1024, 2048)
++            and num_rows <= 32
++            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
++            and current_platform.has_device_capability(90)
++            # sm12x (GB10): cooperative cluster launch fails ("invalid argument");
++            # fall through to persistent_topk which is exact and sm12x-safe.
++            and not current_platform.has_device_capability(120)
++        )
++        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
++            512,
++            1024,
++            2048,
++        )
++        if use_cooperative_topk:
++            workspace_manager = current_workspace_manager()
++            (topk_workspace,) = workspace_manager.get_simultaneous(
++                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++            )
++            torch.ops._C.cooperative_topk(
++                logits,
++                seq_lens,
++                topk_indices,
++                topk_workspace,
++                topk_tokens,
++                attn_metadata_narrowed.max_seq_len,
++            )
++        elif use_persistent_topk:
++            workspace_manager = current_workspace_manager()
++            (topk_workspace,) = workspace_manager.get_simultaneous(
++                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++            )
++            torch.ops._C.persistent_topk(
++                logits,
++                seq_lens,
++                topk_indices,
++                topk_workspace,
++                topk_tokens,
++                attn_metadata_narrowed.max_seq_len,
++            )
++        else:
++            ops.top_k_per_row_decode(
++                logits,
++                next_n,
++                seq_lens,
++                topk_indices,
++                num_rows,
++                logits.stride(0),
++                logits.stride(1),
++                topk_tokens,
++            )
++
++        if decode_metadata.requires_padding:
++            # if padded, we need to unpack
++            # the topk indices removing padded tokens
++            topk_indices = unpack_seq_triton(
++                topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
++                decode_lens,
++            )
++            topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
++                topk_indices
++            )
++
++    return topk_indices_buffer
++
++
++def sparse_attn_indexer_fake(
++    hidden_states: torch.Tensor,
++    k_cache_prefix: LayerNameType,
++    kv_cache: torch.Tensor,
++    q_quant: torch.Tensor,
++    q_scale: torch.Tensor | None,
++    k: torch.Tensor,
++    weights: torch.Tensor,
++    quant_block_size: int,
++    scale_fmt: str | None,
++    topk_tokens: int,
++    head_dim: int,
++    max_model_len: int,
++    total_seq_lens: int,
++    topk_indices_buffer: torch.Tensor | None,
++    skip_k_cache_insert: bool,
++    use_fp4_cache: bool = False,
++) -> torch.Tensor:
++    return topk_indices_buffer
++
++
++direct_register_custom_op(
++    op_name="sparse_attn_indexer",
++    op_func=sparse_attn_indexer,
++    mutates_args=["topk_indices_buffer"],
++    fake_impl=sparse_attn_indexer_fake,
++    dispatch_key=current_platform.dispatch_key,
++)
++
++
++@CustomOp.register("sparse_attn_indexer")
++class SparseAttnIndexer(CustomOp):
++    """Sparse Attention Indexer Custom Op Layer. This layer is extracted as a
++    separate custom op since it involves heavy custom kernels like `mqa_logits`,
++    `paged_mqa_logits` and `top_k_per_row`, etc. Those kernels maybe requires
++    specific memory layout or implementation for different hardware backends to
++    achieve optimal performance.
++
++    For now, the default native path will use CUDA backend path. Other platform
++    may requires add the corresponding Custom Op name `sparse_attn_indexer` to
++    `custom_ops` in `CompilationConfig` to enable the platform specific path.
++    """
++
++    def __init__(
++        self,
++        k_cache,
++        quant_block_size: int,
++        scale_fmt: str,
++        topk_tokens: int,
++        head_dim: int,
++        max_model_len: int,
++        max_total_seq_len: int,
++        topk_indices_buffer: torch.Tensor,
++        skip_k_cache_insert: bool = False,
++        use_fp4_cache: bool = False,
++    ):
++        super().__init__()
++        self.k_cache = k_cache
++        self.quant_block_size = quant_block_size
++        self.scale_fmt = scale_fmt
++        self.topk_tokens = topk_tokens
++        self.head_dim = head_dim
++        self.max_model_len = max_model_len
++        self.max_total_seq_len = max_total_seq_len
++        self.topk_indices_buffer = topk_indices_buffer
++        self.skip_k_cache_insert = skip_k_cache_insert
++        self.use_fp4_cache = use_fp4_cache
++        if current_platform.is_cuda() and not has_deep_gemm():
++            raise RuntimeError(
++                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
++                "the current vLLM environment."
++            )
++
++    def forward_native(
++        self,
++        hidden_states: torch.Tensor,
++        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
++        k: torch.Tensor,
++        weights: torch.Tensor,
++    ):
++        if current_platform.is_cuda() or current_platform.is_xpu():
++            return self.forward_cuda(hidden_states, q_quant, k, weights)
++        elif current_platform.is_rocm():
++            return self.forward_hip(hidden_states, q_quant, k, weights)
++        else:
++            raise NotImplementedError(
++                "SparseAttnIndexer native forward is only implemented for "
++                "CUDA, ROCm and XPU platforms."
++            )
++
++    def forward_cuda(
++        self,
++        hidden_states: torch.Tensor,
++        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
++        k: torch.Tensor,
++        weights: torch.Tensor,
++    ):
++        # FP8 path: single tensor (per-token scale is folded into `weights`).
++        # FP4 path: (values, scales) tuple with scales required by the kernel.
++        if isinstance(q_quant, tuple):
++            q_values, q_scale = q_quant
++        else:
++            q_values, q_scale = q_quant, None
++        return torch.ops.vllm.sparse_attn_indexer(
++            hidden_states,
++            _encode_layer_name(self.k_cache.prefix),
++            self.k_cache.kv_cache,
++            q_values,
++            q_scale,
++            k,
++            weights,
++            self.quant_block_size,
++            self.scale_fmt,
++            self.topk_tokens,
++            self.head_dim,
++            self.max_model_len,
++            self.max_total_seq_len,
++            self.topk_indices_buffer,
++            self.skip_k_cache_insert,
++            self.use_fp4_cache,
++        )
++
++    def forward_xpu(
++        self,
++        hidden_states: torch.Tensor,
++        q_fp8: torch.Tensor,
++        k: torch.Tensor,
++        weights: torch.Tensor,
++    ):
++        return self.forward_cuda(hidden_states, q_fp8, k, weights)
++
++    def forward_hip(
++        self,
++        hidden_states: torch.Tensor,
++        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
++        k: torch.Tensor,
++        weights: torch.Tensor,
++    ):
++        assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
++        assert isinstance(q_quant, torch.Tensor), (
++            "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
++        )
++        if rocm_aiter_ops.is_enabled():
++            return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
++                hidden_states,
++                _encode_layer_name(self.k_cache.prefix),
++                self.k_cache.kv_cache,
++                q_quant,
++                k,
++                weights,
++                self.quant_block_size,
++                self.scale_fmt,
++                self.topk_tokens,
++                self.head_dim,
++                self.max_model_len,
++                self.max_total_seq_len,
++                self.topk_indices_buffer,
++                skip_k_cache_insert=self.skip_k_cache_insert,
++            )
++        raise RuntimeError(
++            "Sparse attention indexer ROCm path is only supported on AITER. "
++            "Please enable aiter with VLLM_ROCM_USE_AITER=1"
++        )
+diff --git a/overlay-deepseek-v4-gb10/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/overlay-deepseek-v4-gb10/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+new file mode 100644
+index 0000000..8dc0f07
+--- /dev/null
++++ b/overlay-deepseek-v4-gb10/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+@@ -0,0 +1,109 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# PATCHED (sm12x / GB10): adapt the o_proj fp8_einsum call to DeepGEMM nv_dev (PR #324 sm120 kernels).
++# AEON's SM100 path passes int32-packed UE8M0 activation scales, a 2D (h*d, r) weight, and a 2D e8m0
++# weight scale. nv_dev's fp8_einsum('bhr,hdr->bhd') expects unpacked fp32 scales and a 3D (h,d,r)
++# weight (see DeepGEMM tests/test_einsum.py::test_fp8_bhr_hdr_bhd). This shim converts on sm12x only.
++import torch
++import torch.nn as nn
++
++from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
++    fused_inv_rope_fp8_quant,
++)
++from vllm.platforms import current_platform
++from vllm.utils.deep_gemm import fp8_einsum
++
++_USE_SM12X = None
++
++
++def _sm12x() -> bool:
++    global _USE_SM12X
++    if _USE_SM12X is None:
++        cap = current_platform.get_device_capability()
++        _USE_SM12X = cap is not None and cap.major >= 12
++    return _USE_SM12X
++
++
++def _ue8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
++    """UE8M0 -> fp32 (exact): place the 8-bit exponent into the fp32 exponent field.
++    Handles int32-packed (4 UE8M0 bytes per int32, little-endian) and raw float8_e8m0fnu."""
++    e8 = getattr(torch, "float8_e8m0fnu", None)
++    if scale.dtype == torch.int32:
++        u8 = scale.contiguous().view(torch.uint8)      # [..., k*4] bytes in logical order
++    elif e8 is not None and scale.dtype == e8:
++        u8 = scale.contiguous().view(torch.uint8)
++    else:
++        return scale.to(torch.float32)
++    return (u8.to(torch.int32) << 23).view(torch.float32)
++
++
++def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
++    """fp8_einsum recipe + scale layout for the current GPU arch.
++
++    SM90: FP32 block scales stay [g, r/128, d/128] -> sfb_gran_mn=128.
++    SM100: INT32 packed scales become [g, r, ...] -> sfb_gran_mn=1.
++
++    Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
++    """
++    cap = current_platform.get_device_capability()
++    assert cap is not None, "DeepseekV4 attention requires a CUDA device"
++    einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
++    tma_aligned_scales = cap.major >= 10
++    return einsum_recipe, tma_aligned_scales
++
++
++def deep_gemm_fp8_o_proj(
++    o: torch.Tensor,
++    positions: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    wo_a: nn.Module,
++    wo_b: nn.Module,
++    *,
++    n_groups: int,
++    heads_per_group: int,
++    nope_dim: int,
++    rope_dim: int,
++    o_lora_rank: int,
++    einsum_recipe: tuple[int, int, int],
++    tma_aligned_scales: bool,
++) -> torch.Tensor:
++    """O projection: inverse RoPE + FP8 quant + einsum + wo_b."""
++    o_fp8, o_scale = fused_inv_rope_fp8_quant(
++        o,
++        positions,
++        cos_sin_cache,
++        n_groups=n_groups,
++        heads_per_group=heads_per_group,
++        nope_dim=nope_dim,
++        rope_dim=rope_dim,
++        tma_aligned_scales=tma_aligned_scales,
++    )
++    z = torch.empty(
++        (o.shape[0], n_groups, o_lora_rank),
++        device=o.device,
++        dtype=torch.bfloat16,
++    )
++    if _sm12x():
++        # nv_dev sm120 einsum: unpacked fp32 scales + 3D weight.
++        b, h, r = o_fp8.shape
++        d = o_lora_rank
++        o_s = _ue8m0_to_fp32(o_scale).reshape(b, h, -1)[:, :, : (r + 127) // 128]
++        w3 = getattr(wo_a, "_sm12x_w3", None)
++        if w3 is None:
++            w3 = wo_a.weight.reshape(h, d, r)
++            ws = (
++                _ue8m0_to_fp32(wo_a.weight_scale_inv)
++                .reshape(h, (d + 127) // 128, (r + 127) // 128)
++                .contiguous()
++            )
++            wo_a._sm12x_w3, wo_a._sm12x_ws = w3, ws
++        fp8_einsum("bhr,hdr->bhd", (o_fp8, o_s.contiguous()), (w3, wo_a._sm12x_ws), z)
++    else:
++        fp8_einsum(
++            "bhr,hdr->bhd",
++            (o_fp8, o_scale),
++            (wo_a.weight, wo_a.weight_scale_inv),
++            z,
++            recipe=einsum_recipe,
++        )
++    return wo_b(z.flatten(1))
+-- 
+2.53.0.windows.2
+
