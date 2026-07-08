@@ -8,6 +8,26 @@ This repository is intentionally separate from the public `aeon-vllm-ultimate` Q
 
 Experimental. Do not treat this as a production default yet.
 
+There are now two tester tracks:
+
+| Track | Image family | Purpose | Status |
+|---|---|---|---|
+| PR #4 GB10 compatibility | `vllm-ultimate-deepseek-v4-gb10` | Make DeepSeek-V4-Flash boot on GB10 with stock Cutlass 4.6.0, DeepGEMM sm120, FlashInfer 0.6.14, and PIECEWISE TP2 safety | Build validated; PR author reports 66.4 aggregate tok/s on 2x Spark |
+| DSpark + B12X + NVFP4 MLA | `vllm-ultimate-deepseek-v4-dspark-b12x-nvfp4` | Add `b12x==0.30.0`, native MXFP4 B12X MoE path, DSpark proposer, and `nvfp4_ds_mla` KV cache | Build/import smoke validated on Spark; needs 2-node tester runtime validation |
+
+Important A/B result: PR #4 is not a Qwen/Gemma default upgrade. On Qwen3.6
+DFlash fast-path, the current default image remains better at c=4 aggregate
+throughput than the PR #4 layer. Keep this repo isolated for DeepSeek-V4 TP2.
+
+| Qwen3.6 A/B | TTFT p50 | TPOT p50 | Decode p50 | c=4 aggregate p50 |
+|---|---:|---:|---:|---:|
+| Current default, FULL_AND_PIECEWISE | 308 ms | 45.77 ms | 22.09 tok/s | 53.21 tok/s |
+| Current default, PIECEWISE | 340 ms | 42.16 ms | 24.03 tok/s | 45.10 tok/s |
+| PR #4 layer, FULL_AND_PIECEWISE | 334 ms | 42.43 ms | 24.02 tok/s | 46.10 tok/s |
+| PR #4 layer, PIECEWISE | 311 ms | 46.97 ms | 21.60 tok/s | 45.78 tok/s |
+
+Raw A/B harness and JSON results are in `benchmarks/qwen36-pr4-ab/`.
+
 The layer is designed for:
 
 - 2x DGX Spark
@@ -36,6 +56,17 @@ The DeepSeek layer lives in:
 - `thrmma_shim.py`
 - `README-DEEPSEEK-V4-GB10.md`
 
+The newer DSpark/B12X/NVFP4 layer lives in:
+
+- `Dockerfile.deepseek-v4-dspark-b12x-nvfp4-layer`
+- `overlay-dspark-b12x-nvfp4/`
+- `patches/official-main-b12x-nvfp4-python.patch`
+- `patches/apply-dspark-envs.py`
+- `patches/apply-dspark-stage-c.py`
+- `scripts/build-deepseek-v4-dspark-b12x-nvfp4.sh`
+- `scripts/serve-deepseek-v4-dspark-b12x-tp2.sh`
+- `README-DEEPSEEK-V4-DSPARK-B12X-NVFP4.md`
+
 It keeps the base image's stock `nvidia-cutlass-dsl 4.6.0` and layers in:
 
 - `ThrMma` / `TiledMma` compatibility shim for `cutlass.cute.core`
@@ -48,6 +79,7 @@ It keeps the base image's stock `nvidia-cutlass-dsl 4.6.0` and layers in:
 - CUTE `nvvm.fmax` feature detection overlay
 
 See [README-DEEPSEEK-V4-GB10.md](README-DEEPSEEK-V4-GB10.md) for the original technical breakdown.
+See [README-DEEPSEEK-V4-DSPARK-B12X-NVFP4.md](README-DEEPSEEK-V4-DSPARK-B12X-NVFP4.md) for the B12X/NVFP4 DSpark track.
 
 ## Build
 
@@ -73,6 +105,14 @@ IMAGE=ghcr.io/aeon-7/vllm-ultimate-deepseek-v4-gb10:test-001 \
   ./scripts/build-deepseek-v4-gb10.sh
 ```
 
+Build the DSpark/B12X/NVFP4 experimental image:
+
+```bash
+IMAGE=ghcr.io/aeon-7/vllm-ultimate-deepseek-v4-dspark-b12x-nvfp4:test-001 \
+BASE_IMAGE=aeon-vllm-ultimate:deepseek-v4-gb10-ab \
+  ./scripts/build-deepseek-v4-dspark-b12x-nvfp4.sh
+```
+
 ## Push To GHCR
 
 Login first:
@@ -85,6 +125,7 @@ Then push the image:
 
 ```bash
 ./scripts/push-ghcr.sh ghcr.io/aeon-7/vllm-ultimate-deepseek-v4-gb10:test-001
+./scripts/push-ghcr.sh ghcr.io/aeon-7/vllm-ultimate-deepseek-v4-dspark-b12x-nvfp4:test-001
 ```
 
 Keep GHCR package visibility private unless/until this build graduates from experimental.

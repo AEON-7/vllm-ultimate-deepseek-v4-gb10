@@ -1,0 +1,74 @@
+# aeon-vllm-ultimate + DeepSeek-V4 DSpark/B12X/NVFP4-MLA experimental layer.
+#
+# This image is intentionally separate from the Qwen/Gemma hot path. It starts from
+# the proven DeepSeek-V4 GB10 PR layer, then adds the three missing pieces needed
+# for the native MXFP4 distributed path shown in PR #4 review notes:
+#   1. b12x==0.30.0, installed with --no-deps so pip cannot replace Torch/Triton.
+#   2. B12X MoE/oracle + DSpark scheduler/proposer/model overlays.
+#   3. nvfp4_ds_mla KV-cache plumbing with the DeepSeek-V4 584-byte cache envelope.
+#
+# Keep cudagraph_mode=PIECEWISE for TP2 DeepSeek. FULL decode graph replay captures
+# NCCL collectives and can desync ranks on 2x DGX Spark.
+ARG BASE_IMAGE=aeon-vllm-ultimate:deepseek-v4-gb10-ab
+FROM ${BASE_IMAGE}
+
+LABEL aeon.layer="deepseek-v4-dspark-b12x-nvfp4" \
+      aeon.base="deepseek-v4-gb10-pr4-layer" \
+      aeon.status="experimental" \
+      aeon.fixes="b12x-0.30.0-no-deps,b12x-moe-oracle,dspark-proposer,nvfp4-ds-mla-584b,piecewise-tp2"
+
+ENV TORCH_CUDA_ARCH_LIST=12.1a
+
+# b12x's metadata wants to pull a different Torch/Triton/CUDA stack. Do not let it.
+RUN pip install --no-cache-dir --no-deps \
+      b12x==0.30.0 \
+      nvidia-cutlass-dsl-libs-cu13==4.6.0 && \
+    python3 - <<'PY'
+import b12x
+from b12x.integration import tp_moe
+from b12x.attention import mla
+assert hasattr(tp_moe, "b12x_moe_fp4")
+print("b12x", getattr(b12x, "__version__", "unknown"), "OK")
+print("b12x attention mla", mla.__name__)
+PY
+
+# Official-main DeepSeek V4 NVFP4/B12X Python patch: CacheDType, vLLM config,
+# FlashMLA sparse acceptance, B12X MXFP4 oracle, and B12X expert backend file.
+COPY patches/official-main-b12x-nvfp4-python.patch /tmp/official-main-b12x-nvfp4-python.patch
+RUN cd /usr/local/lib/python3.12/site-packages && \
+    patch -p1 < /tmp/official-main-b12x-nvfp4-python.patch && \
+    rm /tmp/official-main-b12x-nvfp4-python.patch && \
+    cp /usr/local/lib/python3.12/site-packages/vllm/envs.py /tmp/aeon-base-envs.py
+
+# DSpark runtime overlay: scheduler/gpu-runner/proposer, B12X MLA backend,
+# DeepSeek-V4 SM120 helpers, and B12X MoE wiring used by the 2x Spark recipe.
+COPY overlay-dspark-b12x-nvfp4/vllm/ /usr/local/lib/python3.12/site-packages/vllm/
+
+# Preserve the base 0.24 env registry; the upstream DSpark envs.py is older and
+# drops newer symbols used by the base runtime. Then add only the DSpark knobs.
+COPY patches/apply-dspark-envs.py /tmp/apply-dspark-envs.py
+RUN cp /tmp/aeon-base-envs.py /usr/local/lib/python3.12/site-packages/vllm/envs.py && \
+    python3 /tmp/apply-dspark-envs.py && rm /tmp/apply-dspark-envs.py
+
+# Stage C validation of the critical integration points.
+COPY patches/apply-dspark-stage-c.py /tmp/apply-dspark-stage-c.py
+RUN python3 /tmp/apply-dspark-stage-c.py && rm /tmp/apply-dspark-stage-c.py
+
+RUN python3 - <<'PY'
+from vllm.config.cache import CacheDType
+from vllm.v1.kv_cache_interface import get_kv_quant_mode
+import vllm.v1.spec_decode.dspark as dspark
+import vllm.v1.spec_decode.dspark_proposer as dspark_proposer
+import vllm.v1.attention.backends.mla.b12x_mla_sparse as b12x_mla
+import vllm.model_executor.layers.fused_moe.oracle.mxfp4 as mxfp4
+
+assert "nvfp4_ds_mla" in CacheDType.__args__
+assert get_kv_quant_mode("nvfp4_ds_mla").name == "NVFP4"
+assert hasattr(mxfp4.Mxfp4MoeBackend, "B12X_MXFP4")
+print("dspark", dspark.__name__)
+print("dspark proposer", dspark_proposer.__name__)
+print("b12x mla", b12x_mla.__name__)
+print("DeepSeek V4 DSpark/B12X/NVFP4 smoke OK")
+PY
+
+ENTRYPOINT ["/bin/bash"]
