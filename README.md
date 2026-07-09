@@ -1,6 +1,6 @@
 # AEON DeepSeek-V4 GB10 vLLM Experimental Image
 
-[![GHCR](https://img.shields.io/badge/GHCR-vllm--ultimate--deepseek--v4--gb10-blue)](https://github.com/orgs/AEON-7/packages/container/package/vllm-ultimate-deepseek-v4-gb10)
+[![GHCR](https://img.shields.io/badge/GHCR-vllm--ultimate--deepseek--v4--gb10-blue)](https://github.com/users/AEON-7/packages/container/package/vllm-ultimate-deepseek-v4-gb10)
 [![Status](https://img.shields.io/badge/status-experimental-orange)](#current-status)
 [![Tips](https://img.shields.io/badge/%E2%98%95%20Tips-Support%20the%20work-red)](#-tips)
 
