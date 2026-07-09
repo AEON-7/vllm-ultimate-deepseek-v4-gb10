@@ -46,7 +46,7 @@ The most important practical result: stock/dirty DeepSeek-V4 GB10 runs tend to d
 
 ## Attribution
 
-The DeepSeek-V4 GB10 enablement layer is based on [AEON-7/vllm-ultimate-dgx-spark PR #4](https://github.com/AEON-7/vllm-ultimate-dgx-spark/pull/4), submitted by [@gilby](https://github.com/gilby).
+The DeepSeek-V4 GB10 enablement layer is based on [AEON-7/vllm-ultimate-dgx-spark PR #4](https://github.com/AEON-7/vllm-ultimate-dgx-spark/pull/4), submitted by [@gilby](https://github.com/gilby). The original PR patches are archived in [`patches/upstream-pr4-gilby/`](patches/upstream-pr4-gilby/) with the original contributor preserved as the Git author.
 
 AEON-7 packaged, A/B tested, documented, and published this dedicated experimental image so the community can validate the work without destabilizing the main Qwen/Gemma `aeon-vllm-ultimate` path.
 
