@@ -44,6 +44,12 @@ This image packages the PR #4 DeepSeek-V4 GB10 enablement layer:
 
 The most important practical result: stock/dirty DeepSeek-V4 GB10 runs tend to die on kernel, dependency, or graph-capture issues. This layer moves the model from "does not reliably boot on DGX Spark TP=2" toward a reproducible TP=2 test lane.
 
+## Attribution
+
+The DeepSeek-V4 GB10 enablement layer is based on [AEON-7/vllm-ultimate-dgx-spark PR #4](https://github.com/AEON-7/vllm-ultimate-dgx-spark/pull/4), submitted by [@gilby](https://github.com/gilby).
+
+AEON-7 packaged, A/B tested, documented, and published this dedicated experimental image so the community can validate the work without destabilizing the main Qwen/Gemma `aeon-vllm-ultimate` path.
+
 ## Important Disclaimer
 
 This is experimental.
@@ -58,9 +64,13 @@ We are working toward a future universal `aeon-vllm-ultimate` image that cleanly
 
 ## Performance Snapshot
 
+![DeepSeek GB10 story](assets/perf/deepseek_tp2_story.svg)
+
 ### Single DGX Spark Compatibility A/B
 
 This is a non-regression smoke using Qwen3.6 on one DGX Spark. It is not a DeepSeek TP2 throughput benchmark. The point is that the plain PR #4 layer can boot a normal AEON ModelOpt NVFP4 + DFlash workload without obvious performance collapse.
+
+![Single Spark A/B smoke](assets/perf/deepseek_qwen_smoke_delta.svg)
 
 | Image | Single TTFT | Single TPOT | Single Decode | c=4 Aggregate |
 |---|---:|---:|---:|---:|
@@ -86,6 +96,105 @@ The PR layer reports the following DeepSeek-V4-Flash TP=2 validation on 2x DGX S
 | Stable graph mode | `PIECEWISE` |
 
 That should be read as: the image turns an otherwise broken GB10 DeepSeek-V4 TP2 path into a testable one. It is not yet a universal claim for all checkpoints, all fabrics, or all graph modes.
+
+## Experimental Recipes To Test Next
+
+![Experimental recipe map](assets/perf/deepseek_recipe_map.svg)
+
+These are intentionally written as test recipes, not promises. The goal is to give multi-rig testers a shared ladder: first reproduce the known-good TP2 path, then add one risk at a time.
+
+### Recipe A: Stable TP2 Baseline
+
+This is the currently published path.
+
+```text
+image: ghcr.io/aeon-7/vllm-ultimate-deepseek-v4-gb10:experimental-pr4
+model: DeepSeek-V4-Flash
+tp: 2
+expert_parallel: true
+moe_backend: marlin
+linear_backend: triton
+kv_cache_dtype: fp8
+cudagraph_mode: PIECEWISE
+max_model_len: 65536
+max_num_seqs: 8
+max_num_batched_tokens: 4096
+```
+
+Use this to establish that your fabric, cache mounts, model files, and endpoint are healthy before trying DSpark or B12X.
+
+### Recipe B: DSpark-First Trial
+
+Theory: if the DSpark module is available and vLLM registers the `dspark` speculative method cleanly, add speculative decode while keeping the safer FP8 KV and non-B12X MoE path.
+
+```text
+base: Recipe A
+model: DeepSeek-V4-Flash-DSpark or matching DSpark-enabled checkpoint
+speculative_config:
+  method: dspark
+  num_speculative_tokens: 3
+  draft_sample_method: probabilistic
+keep:
+  kv_cache_dtype: fp8
+  moe_backend: marlin
+  cudagraph_mode: PIECEWISE
+```
+
+Success criteria:
+
+- `/v1/models` returns.
+- First chat completes.
+- Acceptance metrics are visible.
+- c=1 and c=2 produce coherent output before testing c=4/c=8.
+
+If this fails, it tells us DSpark needs the newer overlay lane rather than just the PR #4 runtime base.
+
+### Recipe C: B12X + NVFP4 MLA High-Risk Lane
+
+Theory: B12X is the path that could make native MXFP4 MoE and `nvfp4_ds_mla` practical on GB10, especially for DeepSeek-V4 distributed serving.
+
+```text
+base: deepseek-v4-gb10 layer
+add:
+  b12x==0.30.0
+  flashinfer_b12x MoE backend
+  nvfp4_ds_mla CacheDType
+  DSpark proposer/scheduler overlays
+target flags:
+  --moe-backend flashinfer_b12x
+  --kv-cache-dtype nvfp4_ds_mla
+  --speculative-config '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
+  --compilation-config '{"cudagraph_mode":"PIECEWISE","custom_ops":["all"]}'
+```
+
+Current blocker:
+
+```text
+ImportError: cannot import name 'build_flashinfer_mixed_sparse_indices'
+```
+
+Likely fix:
+
+- Align `vllm/models/deepseek_v4/common/ops/__init__.py`, `cache_utils.py`, and `nvidia/flashinfer_sparse.py` from the same upstream overlay generation.
+- Add an import smoke that checks `build_flashinfer_mixed_sparse_indices` exists before publishing.
+- Then test Qwen non-regression, DeepSeek single-node boot, TP2 boot, and only then DSpark+B12X performance.
+
+### Recipe D: Future Universal AEON Image
+
+Long-term target: merge only the common-safe pieces into `aeon-vllm-ultimate`, while keeping model-family overlays optional.
+
+```text
+common runtime:
+  PIECEWISE TP graph safety
+  FlashInfer/CUTLASS/DeepGEMM dependency sanity
+  lazy model-family imports
+  GB10 SM120/SM121a build flags
+model overlays:
+  Qwen/Gemma DFlash path
+  DeepSeek sparse-MLA path
+  optional DSpark path
+  optional B12X MXFP4 MoE path
+```
 
 ## Quickstart: Pull The Image
 

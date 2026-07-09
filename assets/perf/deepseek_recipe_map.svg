@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 430" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="940" height="430" rx="16" fill="#0b0f16"/>
+  <text x="38" y="44" fill="#f0f6fc" font-size="24" font-weight="700">Experimental Recipe Ladder</text>
+  <text x="38" y="72" fill="#8b949e" font-size="14">Add risk one layer at a time. Do not jump straight from baseline TP2 to B12X + DSpark + NVFP4 MLA.</text>
+  <rect x="40" y="112" width="200" height="220" rx="14" fill="#161b22" stroke="#3fb950"/>
+  <text x="60" y="144" fill="#3fb950" font-size="18" font-weight="700">A. Stable TP2</text>
+  <text x="60" y="176" fill="#c9d1d9" font-size="13">Image: experimental-pr4</text>
+  <text x="60" y="198" fill="#c9d1d9" font-size="13">KV: fp8</text>
+  <text x="60" y="220" fill="#c9d1d9" font-size="13">MoE: marlin</text>
+  <text x="60" y="242" fill="#c9d1d9" font-size="13">Graphs: PIECEWISE</text>
+  <text x="60" y="282" fill="#3fb950" font-size="15" font-weight="700">Known test lane</text>
+  <rect x="260" y="112" width="200" height="220" rx="14" fill="#161b22" stroke="#58a6ff"/>
+  <text x="280" y="144" fill="#58a6ff" font-size="18" font-weight="700">B. DSpark FP8</text>
+  <text x="280" y="176" fill="#c9d1d9" font-size="13">Add method=dspark</text>
+  <text x="280" y="198" fill="#c9d1d9" font-size="13">Keep KV fp8</text>
+  <text x="280" y="220" fill="#c9d1d9" font-size="13">Keep marlin MoE</text>
+  <text x="280" y="242" fill="#c9d1d9" font-size="13">Measure acceptance</text>
+  <text x="280" y="282" fill="#58a6ff" font-size="15" font-weight="700">Spec-decode probe</text>
+  <rect x="480" y="112" width="200" height="220" rx="14" fill="#161b22" stroke="#d29922"/>
+  <text x="500" y="144" fill="#e3b341" font-size="18" font-weight="700">C. B12X NVFP4</text>
+  <text x="500" y="176" fill="#c9d1d9" font-size="13">MoE: flashinfer_b12x</text>
+  <text x="500" y="198" fill="#c9d1d9" font-size="13">KV: nvfp4_ds_mla</text>
+  <text x="500" y="220" fill="#c9d1d9" font-size="13">DSpark proposer</text>
+  <text x="500" y="242" fill="#c9d1d9" font-size="13">Fix sparse-index import</text>
+  <text x="500" y="282" fill="#e3b341" font-size="15" font-weight="700">High-risk/high-reward</text>
+  <rect x="700" y="112" width="200" height="220" rx="14" fill="#161b22" stroke="#bc8cff"/>
+  <text x="720" y="144" fill="#bc8cff" font-size="18" font-weight="700">D. Universal AEON</text>
+  <text x="720" y="176" fill="#c9d1d9" font-size="13">Lazy model imports</text>
+  <text x="720" y="198" fill="#c9d1d9" font-size="13">Common TP safety</text>
+  <text x="720" y="220" fill="#c9d1d9" font-size="13">Optional overlays</text>
+  <text x="720" y="242" fill="#c9d1d9" font-size="13">Qwen/Gemma preserved</text>
+  <text x="720" y="282" fill="#bc8cff" font-size="15" font-weight="700">Future package</text>
+  <text x="40" y="374" fill="#8b949e" font-size="13">Validation gate between each step: boot -> short chat -> quality -> c=1 -> c=2/c=4 -> long-context -> soak.</text>
+</svg>

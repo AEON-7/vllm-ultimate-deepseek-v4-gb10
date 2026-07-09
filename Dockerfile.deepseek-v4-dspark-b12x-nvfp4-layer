@@ -12,9 +12,14 @@
 ARG BASE_IMAGE=aeon-vllm-ultimate:deepseek-v4-gb10-ab
 FROM ${BASE_IMAGE}
 
-LABEL aeon.layer="deepseek-v4-dspark-b12x-nvfp4" \
+LABEL org.opencontainers.image.authors="gilby, AEON-7" \
+      org.opencontainers.image.source="https://github.com/AEON-7/vllm-ultimate-deepseek-v4-gb10" \
+      org.opencontainers.image.description="Experimental DeepSeek-V4 DSpark/B12X/NVFP4 lane derived from AEON-7/vllm-ultimate-dgx-spark PR #4 by gilby" \
+      aeon.layer="deepseek-v4-dspark-b12x-nvfp4" \
       aeon.base="deepseek-v4-gb10-pr4-layer" \
       aeon.status="experimental" \
+      aeon.pr="https://github.com/AEON-7/vllm-ultimate-dgx-spark/pull/4" \
+      aeon.pr.author="gilby" \
       aeon.fixes="b12x-0.30.0-no-deps,b12x-moe-oracle,dspark-proposer,nvfp4-ds-mla-584b,piecewise-tp2"
 
 ENV TORCH_CUDA_ARCH_LIST=12.1a

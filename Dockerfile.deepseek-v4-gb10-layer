@@ -27,8 +27,13 @@
 # cudagraph_mode PIECEWISE + --max-num-seqs 8 (FULL decode-graph replay of any capture size
 # desyncs NCCL between the two ranks -> DistBackendError; collectives must stay uncaptured).
 FROM ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0
-LABEL aeon.layer="deepseek-v4-gb10" \
+LABEL org.opencontainers.image.authors="gilby, AEON-7" \
+      org.opencontainers.image.source="https://github.com/AEON-7/vllm-ultimate-deepseek-v4-gb10" \
+      org.opencontainers.image.description="Experimental DeepSeek-V4 GB10 TP2 enablement layer based on AEON-7/vllm-ultimate-dgx-spark PR #4 by gilby" \
+      aeon.layer="deepseek-v4-gb10" \
       aeon.base="2026-07-01-v0.24.0" \
+      aeon.pr="https://github.com/AEON-7/vllm-ultimate-dgx-spark/pull/4" \
+      aeon.pr.author="gilby" \
       aeon.fixes="thrmma-core-shim,deepgemm-nv_dev-sm120,flashinfer-0.6.14-sparse-mla,tvmffi-0.1.11-tilelang-0.1.11,o_proj-sm12x-adapter,persistent-topk-sm12x,triton-e8m0-upcast,nvvm-fmax-feature-detect"
 
 # (1) re-export the classes cutlass-dsl 4.6.0 relocated out of cute.core (PEP 562, lazy).

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 360" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="940" height="360" rx="16" fill="#0b0f16"/>
+  <text x="38" y="44" fill="#f0f6fc" font-size="24" font-weight="700">DeepSeek-V4 on DGX Spark: From Broken Path to TP=2 Test Lane</text>
+  <text x="38" y="72" fill="#8b949e" font-size="14">The published image is experimental, but it turns a cascade of GB10 failures into a reproducible validation path.</text>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+  <rect x="38" y="112" width="195" height="160" rx="14" fill="#161b22" stroke="#e5534b"/>
+  <text x="58" y="144" fill="#ff7b72" font-size="18" font-weight="700">Stock GB10</text>
+  <text x="58" y="176" fill="#c9d1d9" font-size="14">DeepSeek-V4 load fails</text>
+  <text x="58" y="202" fill="#8b949e" font-size="13">CUTLASS, FlashInfer,</text>
+  <text x="58" y="222" fill="#8b949e" font-size="13">DeepGEMM, top-k, E8M0</text>
+  <text x="58" y="250" fill="#ff7b72" font-size="15" font-weight="700">Not a usable TP2 lane</text>
+  <line x1="248" y1="192" x2="322" y2="192" stroke="#58a6ff" stroke-width="3" marker-end="url(#arrow)"/>
+  <rect x="332" y="112" width="245" height="160" rx="14" fill="#161b22" stroke="#3fb950"/>
+  <text x="352" y="144" fill="#3fb950" font-size="18" font-weight="700">PR #4 Image</text>
+  <text x="352" y="176" fill="#c9d1d9" font-size="14">TP=2 + expert-parallel recipe</text>
+  <text x="352" y="204" fill="#f0f6fc" font-size="26" font-weight="800">66.4 tok/s</text>
+  <text x="352" y="226" fill="#8b949e" font-size="13">10 concurrent conversations</text>
+  <text x="352" y="250" fill="#3fb950" font-size="15" font-weight="700">48/48 turns, 0 engine errors</text>
+  <line x1="592" y1="192" x2="666" y2="192" stroke="#58a6ff" stroke-width="3" marker-end="url(#arrow)"/>
+  <rect x="676" y="112" width="226" height="160" rx="14" fill="#161b22" stroke="#d29922"/>
+  <text x="696" y="144" fill="#e3b341" font-size="18" font-weight="700">Next Unlocks</text>
+  <text x="696" y="176" fill="#c9d1d9" font-size="14">DSpark speculative decode</text>
+  <text x="696" y="198" fill="#c9d1d9" font-size="14">B12X native MXFP4 MoE</text>
+  <text x="696" y="220" fill="#c9d1d9" font-size="14">nvfp4_ds_mla KV path</text>
+  <text x="696" y="250" fill="#e3b341" font-size="15" font-weight="700">Experimental blocker remains</text>
+  <rect x="38" y="300" width="864" height="34" rx="9" fill="#111827" stroke="#30363d"/>
+  <text x="58" y="322" fill="#c9d1d9" font-size="13">Rule of the road: keep DeepSeek overlays isolated until Qwen/Gemma non-regression and independent TP2 reports pass.</text>
+</svg>
