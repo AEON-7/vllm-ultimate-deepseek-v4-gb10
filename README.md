@@ -372,6 +372,12 @@ Recommendation:
 
 ## ☕ Tips
 
+AEON-7 models, drafters and tools are built and trained independently, on my own hardware. If they're useful to you, please consider supporting development:
+
+**[Become a member on Patreon → patreon.com/cw/AeonForge7/membership](https://www.patreon.com/cw/AeonForge7/membership)**
+
+Milestones unlock bigger work: reaching **500 paid supporters** will fund fine-tuning larger models and bigger project releases. Supporters also get early access to new releases, such as the [AEON DFlash2 drafter](https://www.patreon.com/AeonForge7/posts/early-access-for-171543895).
+
 If this work saves you time or helps your local AI lab, tips help fund more DGX Spark testing, public containers, and benchmark documentation.
 
 Use the crypto payment details from the main [AEON-7 profile](https://github.com/AEON-7) or the payment section in the model card where this repository is linked.
