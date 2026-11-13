@@ -2,7 +2,7 @@
 
 [![GHCR](https://img.shields.io/badge/GHCR-vllm--ultimate--deepseek--v4--gb10-blue)](https://github.com/users/AEON-7/packages/container/package/vllm-ultimate-deepseek-v4-gb10)
 [![Status](https://img.shields.io/badge/status-experimental-orange)](#current-status)
-[![Tips](https://img.shields.io/badge/%E2%98%95%20Tips-Support%20the%20work-red)](#-tips) [![Buy me a lotus tea on LotusMake](https://lotusmake.com/badges/lotus-tea-dark.v1.svg)](https://lotusmake.com/support?via=tea)
+[![Tips](https://img.shields.io/badge/%E2%98%95%20Tips-Support%20the%20work-red)](#-tips) [![Buy me a coffee on LotusMake](https://lotusmake.com/badges/coffee-light.v2.svg)](https://lotusmake.com/support) [![Subscribe on lotusmake.com](https://lotusmake.com/badges/subscribe-light.v2.svg)](https://lotusmake.com/support?mode=tiers)
 
 Experimental DeepSeek-V4 / DeepSeek-V4-Flash enablement layer for NVIDIA DGX Spark / GB10 / Blackwell.
 
@@ -376,7 +376,7 @@ AEON-7 models, drafters and tools are built and trained independently, on my own
 
 Patreon wrongfully shut down our account without notice and never responded to our appeals, so we built something even better. You can now support the work on **LotusMake**: buy us a Lotus Tea, fund GPU hours, back a project you want to see done, or subscribe for early and full access to publications while supporting what we build. You can become a creator there too: join, apply to become a creator, and get paid for the work you do in public.
 
-[![Buy me a lotus tea on LotusMake](https://lotusmake.com/badges/lotus-tea-dark.v1.svg)](https://lotusmake.com/support?via=tea)
+[![Buy me a coffee on LotusMake](https://lotusmake.com/badges/coffee-light.v2.svg)](https://lotusmake.com/support) [![Subscribe on lotusmake.com](https://lotusmake.com/badges/subscribe-light.v2.svg)](https://lotusmake.com/support?mode=tiers)
 
 **[AEON FORGE on LotusMake → lotusmake.com/c/aeon-forge](https://lotusmake.com/c/aeon-forge)** · **[Subscribe for early and full access](https://lotusmake.com/support?mode=tiers&from=%2Fc%2Faeon-forge)**
 
